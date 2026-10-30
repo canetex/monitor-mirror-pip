@@ -1,9 +1,9 @@
 # mirror.py
 # Top 5 complexidade:
-# 1) PipWindow._tick            O(W*H) — resize + paint do frame
-# 2) TrayApp._build_menu        O(n)   — monta menu da bandeja
-# 3) list_monitors              O(n)   — enumera monitores
-# 4) PipWindow.set_source       O(1)   — troca câmera DXGI
+# 1) PipWindow._blit_source     O(1) GDI StretchBlt
+# 2) TrayApp._build_menu        O(n) — monta menu da bandeja
+# 3) list_monitors              O(n) — enumera monitores
+# 4) PipWindow._tick            O(1)
 # 5) scale_to_fit               O(1)
 
 """Monitor Mirror — PiP na bandeja (fonte escolhida → sempre no primário)."""
@@ -16,20 +16,23 @@ from ctypes import wintypes
 from dataclasses import dataclass
 from typing import Callable, Optional
 
-import dxcam
 import pystray
 import tkinter as tk
-from PIL import Image, ImageDraw, ImageTk
+from PIL import Image, ImageDraw
 
-TARGET_FPS = 30
+# GDI StretchBlt é barato; 15 FPS basta para PiP.
+TARGET_FPS = 15
 TICK_MS = max(1, int(1000 / TARGET_FPS))
 PIP_WIDTH_RATIO = 0.28
 PIP_MARGIN = 24
 GWL_EXSTYLE = -20
 WS_EX_TOOLWINDOW = 0x00000080
 WS_EX_APPWINDOW = 0x00040000
+SRCCOPY = 0x00CC0020
+HALFTONE = 4
 
 user32 = ctypes.windll.user32
+gdi32 = ctypes.windll.gdi32
 
 
 @dataclass(frozen=True)
@@ -196,30 +199,21 @@ class PipWindow:
         self.root = root
         self.primary = primary
         self.source: Optional[MonitorInfo] = None
-        self.camera = None
-        self._photo: Optional[ImageTk.PhotoImage] = None
         self._running = True
         self._visible = False
+        self._tick_scheduled = False
         self._drag_ox = 0
         self._drag_oy = 0
 
         self.win = tk.Toplevel(root)
         self.win.withdraw()
         self.win.overrideredirect(True)
-        self.win.configure(bg="black")
+        self.win.configure(bg="black", cursor="fleur")
         self.win.attributes("-topmost", True)
         self.win.bind("<Escape>", lambda _e: self.hide())
         self.win.bind("<ButtonPress-1>", self._start_drag)
         self.win.bind("<B1-Motion>", self._on_drag)
-
-        self.canvas = tk.Canvas(
-            self.win, bg="black", highlightthickness=0, bd=0, cursor="fleur"
-        )
-        self.canvas.pack(fill=tk.BOTH, expand=True)
-        self.canvas.bind("<ButtonPress-1>", self._start_drag)
-        self.canvas.bind("<B1-Motion>", self._on_drag)
-
-        self.root.after(TICK_MS, self._tick)
+        # Sem Canvas/ImageTk: StretchBlt GDI direto no HWND (CPU baixa).
 
     def _apply_tool_window(self) -> None:
         """Remove da barra de tarefas (WS_EX_TOOLWINDOW). O(1)."""
@@ -236,42 +230,28 @@ class PipWindow:
     def _on_drag(self, event: tk.Event) -> None:  # type: ignore[type-arg]
         self.win.geometry(f"+{event.x_root - self._drag_ox}+{event.y_root - self._drag_oy}")
 
-    def _stop_camera(self) -> None:
-        if self.camera is not None:
-            try:
-                self.camera.stop()
-            except Exception:
-                pass
-            self.camera = None
-
     def set_source(self, source: MonitorInfo) -> None:
         """Troca o monitor capturado e mostra o PiP. O(1)."""
         if source.is_primary:
             return
-        self._stop_camera()
         self.source = source
-        self.camera = dxcam.create(
-            output_idx=source.index,
-            output_color="RGB",
-            max_buffer_len=2,
-            processor_backend="numpy",
-        )
-        if self.camera is None:
-            raise RuntimeError(f"Falha DXGI no monitor {source.index}")
-        self.camera.start(target_fps=TARGET_FPS, video_mode=True)
-
         pip_w, pip_h, left, top = pip_geometry(self.primary, source)
         self.win.geometry(f"{pip_w}x{pip_h}+{left}+{top}")
         self.show()
 
     def show(self) -> None:
+        """Exibe PiP e retoma blit GDI (sai do idle). O(1)."""
+        if self.source is None:
+            return
         self._visible = True
         self.win.deiconify()
         self._apply_tool_window()
         self.win.attributes("-topmost", True)
         self.win.lift()
+        self._schedule_tick()
 
     def hide(self) -> None:
+        """Oculta PiP e para o loop (idle ~0% CPU). O(1)."""
         self._visible = False
         self.win.withdraw()
 
@@ -283,35 +263,61 @@ class PipWindow:
 
     def shutdown(self) -> None:
         self._running = False
-        self._stop_camera()
+        self._visible = False
         try:
             self.win.destroy()
         except tk.TclError:
             pass
 
-    def _tick(self) -> None:
-        """Captura frame e redesenha o PiP. O(W*H)."""
-        if not self._running:
+    def _schedule_tick(self) -> None:
+        """Agenda próximo frame só se visível. O(1)."""
+        if not self._running or not self._visible or self._tick_scheduled:
             return
-        if self._visible and self.camera is not None:
-            frame = self.camera.get_latest_frame()
-            if frame is not None:
-                img = Image.fromarray(frame)
-                dst_w = max(1, self.canvas.winfo_width())
-                dst_h = max(1, self.canvas.winfo_height())
-                out_w, out_h = scale_to_fit(img.width, img.height, dst_w, dst_h)
-                if (out_w, out_h) != (img.width, img.height):
-                    img = img.resize((out_w, out_h), Image.Resampling.BILINEAR)
-                self._photo = ImageTk.PhotoImage(img)
-                self.canvas.delete("frame")
-                self.canvas.create_image(
-                    dst_w // 2,
-                    dst_h // 2,
-                    image=self._photo,
-                    anchor="center",
-                    tags="frame",
-                )
+        self._tick_scheduled = True
         self.root.after(TICK_MS, self._tick)
+
+    def _blit_source(self) -> None:
+        """Copia o monitor fonte → janela PiP via StretchBlt. O(1) GDI."""
+        if self.source is None:
+            return
+        self.win.update_idletasks()
+        hwnd = int(self.win.winfo_id())
+        dst_w = max(1, self.win.winfo_width())
+        dst_h = max(1, self.win.winfo_height())
+        hdc_screen = user32.GetDC(0)
+        hdc_dst = user32.GetDC(hwnd)
+        if not hdc_screen or not hdc_dst:
+            if hdc_screen:
+                user32.ReleaseDC(0, hdc_screen)
+            if hdc_dst:
+                user32.ReleaseDC(hwnd, hdc_dst)
+            return
+        try:
+            gdi32.SetStretchBltMode(hdc_dst, HALFTONE)
+            gdi32.StretchBlt(
+                hdc_dst,
+                0,
+                0,
+                dst_w,
+                dst_h,
+                hdc_screen,
+                self.source.left,
+                self.source.top,
+                self.source.width,
+                self.source.height,
+                SRCCOPY,
+            )
+        finally:
+            user32.ReleaseDC(hwnd, hdc_dst)
+            user32.ReleaseDC(0, hdc_screen)
+
+    def _tick(self) -> None:
+        """Blita 1 frame GDI. Idle = não reagenda."""
+        self._tick_scheduled = False
+        if not self._running or not self._visible:
+            return
+        self._blit_source()
+        self._schedule_tick()
 
 
 class TrayApp:
@@ -440,6 +446,13 @@ class TrayApp:
 
 
 def main() -> None:
+    # Nome amigável no Task Manager / jumplists (Windows).
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            "canetex.MonitorMirrorPiP"
+        )
+    except Exception:
+        pass
     TrayApp().run()
 
 

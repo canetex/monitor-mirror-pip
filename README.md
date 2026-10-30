@@ -11,35 +11,29 @@ Ideal para acompanhar um display virtual (Sunshine, Moonlight, apps em segundo m
 - **Clique direito**: escolher o monitor fonte
 - Janela **borderless** (sem barra de título), arrastável
 - Sempre no **monitor primário**
-- Processo aparece no Task Manager como `MonitorMirrorPiP.exe`
+- Blit via **GDI StretchBlt** (CPU baixa com PiP ativo)
+- **Idle** ao ocultar: para o loop de frames (~0% CPU)
+- Task Manager: **Monitor Mirror PiP** / `MonitorMirrorPiP.exe`
 - Opcional: inicia com o Windows
 
 ## Requisitos
 
 - Windows 10/11
-- Python 3.10+ (apenas para instalação via script)
 - Dois ou mais monitores ativos (físico e/ou virtual)
+- Python 3.10+ só se for rodar/buildar a partir do código-fonte
 
 ## Instalação rápida (release)
 
-1. Baixe o asset `MonitorMirrorPiP-Setup.zip` na [página de Releases](https://github.com/canetex/monitor-mirror-pip/releases).
-2. Extraia e execute `install.ps1` no PowerShell:
+1. Baixe os assets na [página de Releases](https://github.com/canetex/monitor-mirror-pip/releases).
+2. Preferência: rode o **`MonitorMirrorPiP.exe`** standalone (não precisa de Python).
+3. Ou extraia `MonitorMirrorPiP-Setup.zip` e execute:
 
 ```powershell
 Set-ExecutionPolicy -Scope Process Bypass
 .\install.ps1
 ```
 
-O instalador:
-
-- copia o app para `%LOCALAPPDATA%\MonitorMirror`
-- cria venv e instala dependências
-- gera `MonitorMirrorPiP.exe` (nome visível no Task Manager)
-- cria atalhos no Desktop, Menu Iniciar e **Startup**
-
-### Executável standalone
-
-Na mesma release há `MonitorMirrorPiP.exe` (PyInstaller). Basta baixar e executar — não precisa instalar Python. O ícone fica na bandeja.
+O instalador copia o exe para `%LOCALAPPDATA%\MonitorMirror` e cria atalhos (Desktop, Menu Iniciar, Startup).
 
 ## Uso
 
@@ -66,10 +60,9 @@ Testes:
 python -m pytest tests -q
 ```
 
-### Dependências
+### Dependências (dev)
 
-- `dxcam` — captura DXGI (GPU)
-- `Pillow` — frames / ícone
+- `Pillow` — ícone da bandeja
 - `pystray` — bandeja
 
 ## Arquitetura
@@ -77,26 +70,29 @@ python -m pytest tests -q
 ```
 Bandeja (pystray)
     │ clique direito → seleciona monitor fonte (não-primário)
-    │ clique esquerdo → show/hide
+    │ clique esquerdo → show/hide (idle sem blit)
     ▼
 PipWindow (tkinter, overrideredirect)
     │ sempre no monitor primário
-    │ captura via dxcam (output_idx da fonte)
     ▼
-Frame RGB → resize letterbox → canvas
+GDI StretchBlt (desktop DC → HWND do PiP)
 ```
 
 ## Build do release
 
 ```powershell
 .\.venv\Scripts\pip install pyinstaller
+python -c "from mirror import make_tray_icon; make_tray_icon(256).save('monitor-mirror.ico', format='ICO', sizes=[(16,16),(32,32),(48,48),(256,256)])"
 .\.venv\Scripts\pyinstaller --noconfirm --clean --onefile --noconsole `
   --name MonitorMirrorPiP `
+  --version-file version_info.txt `
+  --icon monitor-mirror.ico `
   --hidden-import=pystray._win32 `
+  --collect-all pystray `
   mirror.py
 ```
 
-O binário sai em `dist\MonitorMirrorPiP.exe`.
+O binário sai em `dist\MonitorMirrorPiP.exe` (FileDescription = *Monitor Mirror PiP*).
 
 ## Licença
 

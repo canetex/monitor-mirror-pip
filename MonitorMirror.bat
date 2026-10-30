@@ -1,3 +1,2 @@
 @echo off
-cd /d "%LOCALAPPDATA%\MonitorMirror"
-wscript.exe "%LOCALAPPDATA%\MonitorMirror\launch.vbs"
+start "" "%LOCALAPPDATA%\MonitorMirror\MonitorMirrorPiP.exe"
